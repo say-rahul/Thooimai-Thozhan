@@ -5,3 +5,4 @@ pillow
 torch
 torchvision
 huggingface-hub
+supabase
