@@ -207,7 +207,6 @@ def process_latest_ticket():
         raise HTTPException(status_code=500, detail="Supabase client not configured.")
 
     try:
-        # Fetch latest pending ticket
         response = supabase.table("pickup_tickets") \
             .select("*") \
             .eq("ai_verification_status", "pending") \
@@ -226,25 +225,20 @@ def process_latest_ticket():
         if not photo_path:
             raise HTTPException(status_code=400, detail="Ticket missing waste_photo_path")
 
-        # Get signed photo URL from Supabase Storage
         signed_res = supabase.storage.from_("waste-photos").create_signed_url(photo_path, 120)
-        signed_url = signed_res.get("signedUrl")
+        signed_url = signed_res.get("signedUrl") if isinstance(signed_res, dict) else getattr(signed_res, "signed_url", None)
 
         if not signed_url:
             raise HTTPException(status_code=400, detail="Could not generate signed photo URL")
 
-        # Download image into memory
         img_bytes = requests.get(signed_url).content
         image = Image.open(BytesIO(img_bytes)).convert("RGB")
 
-        # Classify with PyTorch model
         ai_res = run_model_inference(image)
 
-        # Match verification
         is_match = ai_res["category"].lower() == user_category.lower()
         verification_status = "verified" if is_match else "mismatch"
 
-        # Update record in Supabase
         update_payload = {
             "ai_predicted_category": ai_res["category"],
             "ai_confidence": ai_res["confidence_raw"],
@@ -256,7 +250,6 @@ def process_latest_ticket():
             .eq("id", ticket_id) \
             .execute()
 
-        # Log prediction
         try:
             supabase.table("waste_predictions").insert({
                 "predicted_material": ai_res["predicted_material"],
@@ -285,9 +278,11 @@ def process_latest_ticket():
 # ============================================================
 
 @app.post("/webhook/classify-ticket")
+@app.post("/webhook/classify-ticket/")
 async def classify_ticket_webhook(payload: dict = Body(...)):
     """
     Called by Supabase Database Webhooks whenever a new row is inserted into pickup_tickets.
+    Handles both standard and trailing slash endpoints.
     """
     record = payload.get("record", {})
     ticket_id = record.get("id")
@@ -301,9 +296,8 @@ async def classify_ticket_webhook(payload: dict = Body(...)):
         raise HTTPException(status_code=500, detail="Supabase client not configured")
 
     try:
-        # Download photo via signed URL
         signed_res = supabase.storage.from_("waste-photos").create_signed_url(photo_path, 120)
-        signed_url = signed_res.get("signedUrl")
+        signed_url = signed_res.get("signedUrl") if isinstance(signed_res, dict) else getattr(signed_res, "signed_url", None)
 
         if not signed_url:
             raise HTTPException(status_code=400, detail="Failed to get signed URL")
@@ -311,13 +305,11 @@ async def classify_ticket_webhook(payload: dict = Body(...)):
         img_bytes = requests.get(signed_url).content
         image = Image.open(BytesIO(img_bytes)).convert("RGB")
 
-        # AI Prediction
         ai_res = run_model_inference(image)
 
         is_match = ai_res["category"].lower() == str(user_category).lower()
         verification_status = "verified" if is_match else "mismatch"
 
-        # Update pickup_tickets
         supabase.table("pickup_tickets").update({
             "ai_predicted_category": ai_res["category"],
             "ai_confidence": ai_res["confidence_raw"],
@@ -345,6 +337,7 @@ async def classify_ticket_webhook(payload: dict = Body(...)):
 # ============================================================
 
 @app.post("/predict")
+@app.post("/predict/")
 async def predict(file: UploadFile = File(...)):
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Please upload an image file.")
@@ -396,3 +389,12 @@ def startup():
         print("============================================")
     except Exception as exc:
         print("Model startup load failed:", exc)
+
+# ============================================================
+# ENTRYPOINT FOR RENDER PORT BINDING
+# ============================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
