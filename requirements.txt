@@ -6,3 +6,5 @@ torch
 torchvision
 huggingface-hub
 supabase
+python-dotenv
+requests
