@@ -1,22 +1,24 @@
 import os
 import requests
 from io import BytesIO
-from threading import Lock
+from PIL import Image
 
-from PIL import Image, ImageOps, UnidentifiedImageError
 import torch
-from fastai.vision.all import PILImage
-from huggingface_hub import from_pretrained_fastai
+from torchvision import models, transforms
+from huggingface_hub import hf_hub_download
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 
-
 app = FastAPI(
     title="Thooimai Waste AI",
-    version="2.1.0",
+    version="1.0.0",
 )
+
+# ============================================================
+# CORS MIDDLEWARE
+# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,9 +28,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # ============================================================
-# SUPABASE CONFIGURATION
+# SUPABASE
 # ============================================================
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -42,33 +43,64 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
         SUPABASE_SERVICE_ROLE_KEY,
     )
 
-
 # ============================================================
 # MODEL CONFIGURATION
 # ============================================================
 
-MODEL_REPO = "C0mpl1cated3/trash_classifier_v2"
+MODEL_REPO = "karthikeya09/smart_image_recognation"
+MODEL_FILE = "best_model.pth"
+
+MODEL_CLASSES = [
+    "glass",
+    "metal",
+    "non-recyclable",
+    "organic",
+    "paper",
+    "plastic",
+]
 
 APP_CATEGORIES = {
-    "cardboard": "Paper",
-    "e-waste": "Other",
-    "glass": "Glass",
-    "metal": "Metal",
     "organic": "Wet Waste",
-    "paper": "Paper",
     "plastic": "Plastic",
-    "textile": "Other",
+    "paper": "Paper",
+    "metal": "Metal",
+    "glass": "Glass",
+    "non-recyclable": "Other",
 }
 
-# Initial threshold only. Validate this against labelled images.
-MIN_CONFIDENCE = 0.60
+# Transform pipeline matching MobileNetV2 training
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225],
+    ),
+])
 
 model = None
-model_lock = Lock()
-
 
 # ============================================================
-# LAZY MODEL LOADING
+# MODEL ARCHITECTURE
+# ============================================================
+
+class WasteClassifier(torch.nn.Module):
+    def __init__(self, num_classes=6):
+        super().__init__()
+        self.backbone = models.mobilenet_v2(weights=None)
+        self.backbone.classifier = torch.nn.Sequential(
+            torch.nn.Dropout(p=0.2),
+            torch.nn.Linear(
+                self.backbone.last_channel,
+                num_classes,
+            ),
+        )
+
+    def forward(self, x):
+        return self.backbone(x)
+
+# ============================================================
+# LOAD MODEL
 # ============================================================
 
 def load_model():
@@ -77,224 +109,72 @@ def load_model():
     if model is not None:
         return model
 
-    with model_lock:
-        if model is not None:
-            return model
+    print("============================================")
+    print("Loading Thooimai Waste AI model...")
+    print("============================================")
 
-        print(f"Loading waste model: {MODEL_REPO}")
+    model_path = hf_hub_download(
+        repo_id=MODEL_REPO,
+        filename=MODEL_FILE,
+    )
 
-        try:
-            learner = from_pretrained_fastai(MODEL_REPO)
-            learner.model.eval()
+    print("Model downloaded from Hugging Face:", model_path)
 
-            labels = [
-                str(label).strip().lower()
-                for label in learner.dls.vocab
-            ]
+    net = WasteClassifier(num_classes=len(MODEL_CLASSES))
+    checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
 
-            if not labels:
-                raise RuntimeError("The model returned no class labels.")
+    if isinstance(checkpoint, dict):
+        if "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        elif "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        else:
+            state_dict = checkpoint
+    else:
+        state_dict = checkpoint
 
-            missing = [
-                label for label in labels
-                if label not in APP_CATEGORIES
-            ]
+    net.load_state_dict(state_dict, strict=True)
+    net.eval()
 
-            if missing:
-                raise RuntimeError(
-                    "Missing category mappings for: "
-                    + ", ".join(missing)
-                )
+    model = net
 
-            model = learner
+    print("============================================")
+    print("Waste AI model loaded successfully.")
+    print("Classes:", MODEL_CLASSES)
+    print("============================================")
 
-            print("Waste model loaded successfully.")
-            print("Model classes:", labels)
+    return model
 
-            return model
-
-        except Exception as error:
-            print(f"Model loading failed: {error}")
-            raise RuntimeError(
-                "Could not load the Hugging Face waste model. "
-                "Check the repository loading instructions and Render logs."
-            ) from error
-
-
-# ============================================================
-# IMAGE INFERENCE
-# ============================================================
-
+# Core prediction helper function
 def run_model_inference(image: Image.Image):
-    learner = load_model()
+    net = load_model()
+    tensor = transform(image).unsqueeze(0)
 
-    image = ImageOps.exif_transpose(image).convert("RGB")
-    pil_image = PILImage.create(image)
+    with torch.no_grad():
+        logits = net(tensor)
+        probabilities = torch.softmax(logits, dim=1)[0]
 
-    with torch.inference_mode():
-        predicted_label, predicted_index, probabilities = (
-            learner.predict(pil_image)
-        )
+    confidence, index = torch.max(probabilities, dim=0)
 
-    material = str(predicted_label).strip().lower()
-
-    classes = [
-        str(label).strip().lower()
-        for label in learner.dls.vocab
-    ]
-
-    if material not in classes:
-        raise RuntimeError(
-            f"Model returned an unknown label: {material}"
-        )
-
-    if material not in APP_CATEGORIES:
-        raise RuntimeError(
-            f"No application category mapping for: {material}"
-        )
-
-    confidence = float(probabilities[int(predicted_index)])
+    predicted_material = MODEL_CLASSES[index.item()]
+    confidence_value = float(confidence.item())
+    application_category = APP_CATEGORIES.get(predicted_material, "Other")
 
     predictions = {
-        label: round(float(probabilities[index]), 4)
-        for index, label in enumerate(classes)
+        MODEL_CLASSES[i]: round(float(probabilities[i].item()), 4)
+        for i in range(len(MODEL_CLASSES))
     }
 
-    needs_review = confidence < MIN_CONFIDENCE
-
     return {
-        "predicted_material": material,
-        "category": APP_CATEGORIES[material],
-        "confidence": round(confidence * 100, 2),
-        "confidence_raw": round(confidence, 4),
+        "predicted_material": predicted_material,
+        "category": application_category,
+        "confidence": round(confidence_value * 100, 2),
+        "confidence_raw": round(confidence_value, 4),
         "predictions": predictions,
-        "needs_review": needs_review,
     }
 
-
 # ============================================================
-# DOWNLOAD IMAGE FROM SUPABASE STORAGE
-# ============================================================
-
-def download_ticket_image(photo_path: str) -> Image.Image:
-    if supabase is None:
-        raise RuntimeError("Supabase client is not configured.")
-
-    if not photo_path:
-        raise RuntimeError("Ticket is missing waste_photo_path.")
-
-    signed_response = (
-        supabase.storage
-        .from_("waste-photos")
-        .create_signed_url(photo_path, 300)
-    )
-
-    if isinstance(signed_response, dict):
-        signed_url = (
-            signed_response.get("signedUrl")
-            or signed_response.get("signedURL")
-        )
-    else:
-        signed_url = getattr(
-            signed_response,
-            "signed_url",
-            None,
-        )
-
-    if not signed_url:
-        raise RuntimeError("Could not generate signed photo URL.")
-
-    response = requests.get(signed_url, timeout=30)
-    response.raise_for_status()
-
-    if not response.content:
-        raise RuntimeError("Downloaded waste photo is empty.")
-
-    try:
-        return Image.open(
-            BytesIO(response.content)
-        ).convert("RGB")
-
-    except (UnidentifiedImageError, OSError) as error:
-        raise RuntimeError(
-            "The uploaded file is not a valid image."
-        ) from error
-
-
-# ============================================================
-# CLASSIFY AND SAVE TICKET
-# ============================================================
-
-def classify_and_save_ticket(
-    ticket_id: str,
-    photo_path: str,
-    user_category: str,
-):
-    if supabase is None:
-        raise RuntimeError("Supabase client is not configured.")
-
-    image = download_ticket_image(photo_path)
-    result = run_model_inference(image)
-
-    predicted_category = result["category"]
-
-    is_match = (
-        predicted_category.strip().casefold()
-        == str(user_category).strip().casefold()
-    )
-
-    if result["needs_review"]:
-        verification_status = "pending"
-    else:
-        verification_status = (
-            "verified" if is_match else "mismatch"
-        )
-
-    update_result = (
-        supabase.table("pickup_tickets")
-        .update({
-            "ai_predicted_category": predicted_category,
-            "ai_confidence": result["confidence_raw"],
-            "ai_verification_status": verification_status,
-        })
-        .eq("id", ticket_id)
-        .execute()
-    )
-
-    if not update_result.data:
-        raise RuntimeError(
-            "AI inference completed, but the ticket update "
-            "could not be confirmed."
-        )
-
-    # Prediction history is supplementary.
-    try:
-        supabase.table("waste_predictions").insert({
-            "predicted_material": result["predicted_material"],
-            "category": predicted_category,
-            "confidence": result["confidence"],
-            "predictions": result["predictions"],
-            "image_filename": photo_path.split("/")[-1],
-        }).execute()
-
-    except Exception as error:
-        print("Prediction logging failed:", error)
-
-    return {
-        "success": True,
-        "ticket_id": ticket_id,
-        "predicted_material": result["predicted_material"],
-        "predicted_category": predicted_category,
-        "confidence": result["confidence"],
-        "confidence_raw": result["confidence_raw"],
-        "verification_status": verification_status,
-        "needs_review": result["needs_review"],
-        "predictions": result["predictions"],
-    }
-
-
-# ============================================================
-# ROOT AND HEALTH CHECK
+# HEALTH & ROOT
 # ============================================================
 
 @app.get("/")
@@ -304,7 +184,6 @@ def root():
         "status": "online",
     }
 
-
 @app.get("/health")
 def health():
     return {
@@ -313,236 +192,189 @@ def health():
         "supabase_connected": supabase is not None,
     }
 
-
 # ============================================================
-# MODEL INFORMATION
-# ============================================================
-
-@app.get("/model-info")
-def model_info():
-    try:
-        learner = load_model()
-
-        return {
-            "model": MODEL_REPO,
-            "classes": [
-                str(label)
-                for label in learner.dls.vocab
-            ],
-            "status": "loaded",
-        }
-
-    except Exception as error:
-        raise HTTPException(
-            status_code=503,
-            detail=str(error),
-        ) from error
-
-
-# ============================================================
-# PROCESS LATEST PENDING TICKET
+# PROCESS RECENT TICKET FROM SUPABASE
 # ============================================================
 
 @app.post("/process-latest-ticket")
 def process_latest_ticket():
+    """
+    Fetches the latest ticket with ai_verification_status = 'pending',
+    downloads its photo from Supabase Storage, runs AI classification,
+    and updates the database row.
+    """
     if supabase is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Supabase client not configured.",
-        )
+        raise HTTPException(status_code=500, detail="Supabase client not configured.")
 
     try:
-        response = (
-            supabase.table("pickup_tickets")
-            .select("*")
-            .eq("ai_verification_status", "pending")
-            .order("created_at", desc=True)
-            .limit(1)
+        response = supabase.table("pickup_tickets") \
+            .select("*") \
+            .eq("ai_verification_status", "pending") \
+            .order("created_at", desc=True) \
+            .limit(1) \
             .execute()
-        )
 
-        if not response.data:
-            return {
-                "success": True,
-                "message": "No pending tickets found.",
-            }
+        if not response.data or len(response.data) == 0:
+            return {"success": True, "message": "No pending tickets found."}
 
         ticket = response.data[0]
+        ticket_id = ticket["id"]
+        photo_path = ticket.get("waste_photo_path")
+        user_category = ticket.get("waste_category")
 
-        return classify_and_save_ticket(
-            ticket_id=ticket["id"],
-            photo_path=ticket.get("waste_photo_path"),
-            user_category=ticket.get("waste_category"),
-        )
+        if not photo_path:
+            raise HTTPException(status_code=400, detail="Ticket missing waste_photo_path")
 
-    except HTTPException:
-        raise
+        signed_res = supabase.storage.from_("waste-photos").create_signed_url(photo_path, 120)
+        signed_url = signed_res.get("signedUrl") if isinstance(signed_res, dict) else getattr(signed_res, "signed_url", None)
 
-    except Exception as error:
-        print("Latest ticket processing failed:", error)
+        if not signed_url:
+            raise HTTPException(status_code=400, detail="Could not generate signed photo URL")
 
-        raise HTTPException(
-            status_code=500,
-            detail=f"Ticket processing failed: {str(error)}",
-        ) from error
+        img_bytes = requests.get(signed_url).content
+        image = Image.open(BytesIO(img_bytes)).convert("RGB")
 
+        ai_res = run_model_inference(image)
+
+        is_match = ai_res["category"].lower() == user_category.lower()
+        verification_status = "verified" if is_match else "mismatch"
+
+        update_payload = {
+            "ai_predicted_category": ai_res["category"],
+            "ai_confidence": ai_res["confidence_raw"],
+            "ai_verification_status": verification_status,
+        }
+
+        supabase.table("pickup_tickets") \
+            .update(update_payload) \
+            .eq("id", ticket_id) \
+            .execute()
+
+        try:
+            supabase.table("waste_predictions").insert({
+                "predicted_material": ai_res["predicted_material"],
+                "category": ai_res["category"],
+                "confidence": ai_res["confidence"],
+                "predictions": ai_res["predictions"],
+                "image_filename": photo_path.split("/")[-1],
+            }).execute()
+        except Exception as log_err:
+            print("Waste prediction logging failed:", log_err)
+
+        return {
+            "success": True,
+            "ticket_id": ticket_id,
+            "ai_predicted_category": ai_res["category"],
+            "ai_confidence": ai_res["confidence"],
+            "ai_verification_status": verification_status,
+        }
+
+    except Exception as exc:
+        print("Ticket processing error:", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
 
 # ============================================================
-# SUPABASE WEBHOOK
+# SUPABASE WEBHOOK LISTENER
 # ============================================================
 
 @app.post("/webhook/classify-ticket")
 @app.post("/webhook/classify-ticket/")
-async def classify_ticket_webhook(
-    payload: dict = Body(...),
-):
-    record = payload.get("record") or {}
+async def classify_ticket_webhook(payload: dict = Body(...)):
+    """
+    Called by Supabase Database Webhooks whenever a new row is inserted into pickup_tickets.
+    Handles both standard and trailing slash endpoints.
+    """
+    record = payload.get("record", {})
     ticket_id = record.get("id")
+    photo_path = record.get("waste_photo_path")
+    user_category = record.get("waste_category")
 
-    if not ticket_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing ticket ID in webhook record.",
-        )
+    if not ticket_id or not photo_path:
+        raise HTTPException(status_code=400, detail="Missing ticket_id or photo_path in payload")
 
     if supabase is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Supabase client is not configured.",
-        )
+        raise HTTPException(status_code=500, detail="Supabase client not configured")
 
     try:
-        ticket_response = (
-            supabase.table("pickup_tickets")
-            .select(
-                "id, waste_category, waste_photo_path, "
-                "ai_verification_status"
-            )
-            .eq("id", ticket_id)
-            .maybe_single()
-            .execute()
-        )
+        signed_res = supabase.storage.from_("waste-photos").create_signed_url(photo_path, 120)
+        signed_url = signed_res.get("signedUrl") if isinstance(signed_res, dict) else getattr(signed_res, "signed_url", None)
 
-        ticket = ticket_response.data
+        if not signed_url:
+            raise HTTPException(status_code=400, detail="Failed to get signed URL")
 
-        if not ticket:
-            raise HTTPException(
-                status_code=404,
-                detail="Pickup ticket not found.",
-            )
+        img_bytes = requests.get(signed_url).content
+        image = Image.open(BytesIO(img_bytes)).convert("RGB")
 
-        photo_path = ticket.get("waste_photo_path")
-        user_category = ticket.get("waste_category")
+        ai_res = run_model_inference(image)
 
-        if not photo_path or not user_category:
-            raise HTTPException(
-                status_code=400,
-                detail="Pickup ticket is missing its photo or category.",
-            )
+        is_match = ai_res["category"].lower() == str(user_category).lower()
+        verification_status = "verified" if is_match else "mismatch"
 
-        return classify_and_save_ticket(
-            ticket_id=ticket["id"],
-            photo_path=photo_path,
-            user_category=user_category,
-        )
+        supabase.table("pickup_tickets").update({
+            "ai_predicted_category": ai_res["category"],
+            "ai_confidence": ai_res["confidence_raw"],
+            "ai_verification_status": verification_status,
+        }).eq("id", ticket_id).execute()
 
-    except HTTPException:
-        raise
+        return {
+            "success": True,
+            "ticket_id": ticket_id,
+            "verification_status": verification_status,
+            "predicted_category": ai_res["category"],
+        }
 
-    except Exception as error:
-        print(
-            f"Webhook classification failed for {ticket_id}: {error}"
-        )
+    except Exception as err:
+        print("Webhook classification failed:", err)
 
-        try:
-            (
-                supabase.table("pickup_tickets")
-                .update({"ai_verification_status": "failed"})
-                .eq("id", ticket_id)
-                .execute()
-            )
-        except Exception as update_error:
-            print("Could not save AI failure status:", update_error)
+        supabase.table("pickup_tickets").update({
+            "ai_verification_status": "failed"
+        }).eq("id", ticket_id).execute()
 
-        raise HTTPException(
-            status_code=500,
-            detail=f"AI classification failed: {str(error)}",
-        ) from error
-
+        raise HTTPException(status_code=500, detail=str(err))
 
 # ============================================================
-# DIRECT IMAGE PREDICTION
+# DIRECT MULTIPART FILE PREDICT (LEGACY/DIRECT)
 # ============================================================
 
 @app.post("/predict")
 @app.post("/predict/")
 async def predict(file: UploadFile = File(...)):
-    if (
-        not file.content_type
-        or not file.content_type.startswith("image/")
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Please upload an image file.",
-        )
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Please upload an image file.")
 
     try:
         image_bytes = await file.read()
-
         if not image_bytes:
-            raise HTTPException(
-                status_code=400,
-                detail="Uploaded image is empty.",
-            )
+            raise HTTPException(status_code=400, detail="Uploaded image is empty.")
 
-        try:
-            image = Image.open(
-                BytesIO(image_bytes)
-            ).convert("RGB")
-
-        except (UnidentifiedImageError, OSError) as error:
-            raise HTTPException(
-                status_code=400,
-                detail="Uploaded file is not a valid image.",
-            ) from error
-
-        result = run_model_inference(image)
+        image = Image.open(BytesIO(image_bytes)).convert("RGB")
+        ai_res = run_model_inference(image)
 
         if supabase is not None:
             try:
                 supabase.table("waste_predictions").insert({
-                    "predicted_material": result["predicted_material"],
-                    "category": result["category"],
-                    "confidence": result["confidence"],
-                    "predictions": result["predictions"],
+                    "predicted_material": ai_res["predicted_material"],
+                    "category": ai_res["category"],
+                    "confidence": ai_res["confidence"],
+                    "predictions": ai_res["predictions"],
                     "image_filename": file.filename,
                 }).execute()
-
-            except Exception as error:
-                print("Prediction logging failed:", error)
+            except Exception as db_error:
+                print("Supabase log insert failed:", db_error)
 
         return {
             "success": True,
-            "model": MODEL_REPO,
-            "predicted_material": result["predicted_material"],
-            "category": result["category"],
-            "confidence": result["confidence"],
-            "confidence_raw": result["confidence_raw"],
-            "needs_review": result["needs_review"],
-            "predictions": result["predictions"],
+            "predicted_material": ai_res["predicted_material"],
+            "category": ai_res["category"],
+            "confidence": ai_res["confidence"],
+            "predictions": ai_res["predictions"],
         }
 
     except HTTPException:
         raise
-
-    except Exception as error:
-        print("Prediction error:", error)
-
-        raise HTTPException(
-            status_code=503,
-            detail=f"AI prediction failed: {str(error)}",
-        ) from error
-
+    except Exception as exc:
+        print("Prediction error:", exc)
+        raise HTTPException(status_code=500, detail=f"AI prediction failed: {str(exc)}")
 
 # ============================================================
 # STARTUP
@@ -550,24 +382,19 @@ async def predict(file: UploadFile = File(...)):
 
 @app.on_event("startup")
 def startup():
-    # Do not download the model during startup.
-    # The first /predict or /model-info request loads it.
-    print("Thooimai Waste AI API starting...")
-    print(f"Model will load on first request: {MODEL_REPO}")
-
+    try:
+        load_model()
+        print("============================================")
+        print("Waste AI model pre-loaded successfully.")
+        print("============================================")
+    except Exception as exc:
+        print("Model startup load failed:", exc)
 
 # ============================================================
-# RENDER ENTRYPOINT
+# ENTRYPOINT FOR RENDER PORT BINDING
 # ============================================================
 
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.environ.get("PORT", 10000))
-
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=port,
-        reload=False,
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
