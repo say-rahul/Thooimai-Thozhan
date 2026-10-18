@@ -1,5 +1,10 @@
+fastapi
+uvicorn[standard]
+python-multipart
+requests
+Pillow
+torch
+torchvision
 fastai
 huggingface_hub
-torch
-Pillow
-python-multipart
+supabase
